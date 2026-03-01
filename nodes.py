@@ -142,6 +142,35 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             n.size = 0 # force recalc
         return n
 
+class GGUFModelPatcherDynamic(comfy.model_patcher.ModelPatcherDynamic):
+    patch_on_device = False
+
+    def load(self, *args, **kwargs):
+        super().load(*args, **kwargs)
+        # GGML can't requantize after LoRA - demote lowvram_function to weight_function
+        for n, m in self.model.named_modules():
+            for param_key in ("weight", "bias"):
+                attr = param_key + "_lowvram_function"
+                fn = getattr(m, attr, None)
+                if fn is not None:
+                    setattr(m, attr, None)
+                    fns = getattr(m, param_key + "_function", [])
+                    fns.append(fn)
+                    setattr(m, param_key + "_function", fns)
+        if self.patch_on_device:
+            for key in self.patches:
+                self.patches[key] = move_patch_to_device(self.patches[key], self.load_device)
+
+    def clone(self, disable_dynamic=False, model_override=None):
+        if disable_dynamic:
+            if model_override is None:
+                temp = self.cached_patcher_init[0](*self.cached_patcher_init[1], disable_dynamic=True)
+                model_override = temp.get_clone_model_override()
+            n = _clone_as_gguf_model_patcher(self, model_override=model_override)
+            return n
+        n = super().clone(disable_dynamic=disable_dynamic, model_override=model_override)
+        n.patch_on_device = self.patch_on_device
+        return n
 
 def _clone_patcher_to_gguf(model_patcher):
     if model_patcher.is_dynamic():
