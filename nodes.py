@@ -161,6 +161,38 @@ def _load_gguf_unet(unet_path, ops, disable_dynamic=False):
 
     return model
 
+def _load_gguf_clip_patcher(clip_paths, clip_type, disable_dynamic=False):
+    return _load_gguf_clip(clip_paths, clip_type, disable_dynamic=disable_dynamic).patcher
+
+def _load_gguf_clip(clip_paths, clip_type, disable_dynamic=False):
+    dynamic = not disable_dynamic and comfy.memory_management.aimdo_enabled
+
+    clip_data = []
+    for p in clip_paths:
+        if p.endswith(".gguf"):
+            sd = gguf_clip_loader(p)
+        else:
+            sd = comfy.utils.load_torch_file(p, safe_load=True)
+            if not dynamic and "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
+                raise NotImplementedError(f"Mixing scaled FP8 with GGUF is not supported! Use regular CLIP loader or switch model(s)\n({p})")
+        clip_data.append(sd)
+
+    model_options = {"initial_device": comfy.model_management.text_encoder_offload_device()}
+    if not dynamic:
+        model_options["custom_operations"] = GGMLOps
+
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        clip_type = clip_type,
+        state_dicts = clip_data,
+        model_options = model_options,
+        embedding_directory = folder_paths.get_folder_paths("embeddings"),
+        disable_dynamic = disable_dynamic,
+    )
+    clip.patcher = _clone_patcher_to_gguf(clip.patcher)
+
+    clip.patcher.cached_patcher_init = (_load_gguf_clip_patcher, (clip_paths, clip_type))
+    return clip
+
 class UnetLoaderGGUF:
     @classmethod
     def INPUT_TYPES(s):
@@ -235,35 +267,10 @@ class CLIPLoaderGGUF:
         files += folder_paths.get_filename_list("clip_gguf")
         return sorted(files)
 
-    def load_data(self, ckpt_paths):
-        clip_data = []
-        for p in ckpt_paths:
-            if p.endswith(".gguf"):
-                sd = gguf_clip_loader(p)
-            else:
-                sd = comfy.utils.load_torch_file(p, safe_load=True)
-                if "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
-                    raise NotImplementedError(f"Mixing scaled FP8 with GGUF is not supported! Use regular CLIP loader or switch model(s)\n({p})")
-            clip_data.append(sd)
-        return clip_data
-
-    def load_patcher(self, clip_paths, clip_type, clip_data):
-        clip = comfy.sd.load_text_encoder_state_dicts(
-            clip_type = clip_type,
-            state_dicts = clip_data,
-            model_options = {
-                "custom_operations": GGMLOps,
-                "initial_device": comfy.model_management.text_encoder_offload_device()
-            },
-            embedding_directory = folder_paths.get_folder_paths("embeddings"),
-        )
-        clip.patcher = GGUFModelPatcher.clone(clip.patcher)
-        return clip
-
     def load_clip(self, clip_name, type="stable_diffusion"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
+        return (_load_gguf_clip([clip_path], clip_type),)
 
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -285,7 +292,7 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_path2 = folder_paths.get_full_path("clip", clip_name2)
         clip_paths = (clip_path1, clip_path2)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+        return (_load_gguf_clip(clip_paths, clip_type),)
 
 class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -307,7 +314,7 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_path3 = folder_paths.get_full_path("clip", clip_name3)
         clip_paths = (clip_path1, clip_path2, clip_path3)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+        return (_load_gguf_clip(clip_paths, clip_type),)
 
 class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -331,7 +338,7 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_path4 = folder_paths.get_full_path("clip", clip_name4)
         clip_paths = (clip_path1, clip_path2, clip_path3, clip_path4)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+        return (_load_gguf_clip(clip_paths, clip_type),)
 
 NODE_CLASS_MAPPINGS = {
     "UnetLoaderGGUF": UnetLoaderGGUF,
