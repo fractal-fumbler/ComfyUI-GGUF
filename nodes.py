@@ -212,7 +212,7 @@ def _load_gguf_clip(clip_paths, clip_type, disable_dynamic=False):
     clip_data = []
     for p in clip_paths:
         if p.endswith(".gguf"):
-            sd = gguf_clip_loader(p)
+            sd = gguf_clip_loader(p, dynamic=dynamic)
         else:
             sd = comfy.utils.load_torch_file(p, safe_load=True)
             if not dynamic and "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
@@ -390,4 +390,3 @@ NODE_CLASS_MAPPINGS = {
     "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF,
     "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
 }
-

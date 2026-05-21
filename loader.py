@@ -474,8 +474,8 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
-def gguf_clip_loader(path):
-    sd, extra = gguf_sd_loader(path, is_text_model=True)
+def gguf_clip_loader(path, dynamic=False):
+    sd, extra = gguf_sd_loader(path, is_text_model=True, dynamic=dynamic)
     arch = extra.get("arch_str", None)
     if arch in {"t5", "t5encoder"}:
         temb_key = "token_embd.weight"
