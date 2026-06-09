@@ -138,9 +138,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             torch_tensor = torch_tensor.view(*shape)
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
-        # 1D tensors shouldn't be quantized, this is a fix for BF16
-        if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
-            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
+        # BF16 GGUF tensors are full-precision storage, not compressed quants.
+        if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+            dtype = torch.float32 if len(shape) <= 1 else torch.bfloat16
+            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=dtype)
 
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
