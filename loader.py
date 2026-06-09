@@ -501,6 +501,16 @@ def gguf_clip_loader(path):
         if arch == "qwen2vl":
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
+    elif arch == "ideogram":
+        # Dequantize Ideogram model for inference
+        logging.info("Dequantizing Ideogram model for inference...")
+        dequantized_count = 0
+        for key in list(sd.keys()):
+            if is_quantized(sd[key]):
+                # Dequantize to BF16 to save VRAM while maintaining quality
+                sd[key] = dequantize_tensor(sd[key], dtype=torch.bfloat16)
+                dequantized_count += 1
+        logging.info(f"Dequantized {dequantized_count} tensors for Ideogram model")
     else:
         pass
     return sd
