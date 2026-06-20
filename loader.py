@@ -349,7 +349,7 @@ def gguf_mmproj_loader(path):
             target.append(fname)
 
     if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
+        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')!")
         return {}
     if len(target) > 1:
         logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
@@ -567,7 +567,11 @@ def gguf_clip_loader(path, dynamic=False):
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
         if arch == "qwen2vl" or arch == "qwen3vl":
             vsd = gguf_mmproj_loader(path)
-            sd.update(vsd)
+            if not vsd and arch == "qwen3vl":
+                sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(4608)
+                sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(4096)
+            else:
+                sd.update(vsd)
     else:
         pass
     return sd
