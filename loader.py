@@ -8,10 +8,41 @@ import os
 
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
+from .quant_ops import make_quantized
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
+IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram4"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
+
+def device_supports_bf16():
+    """
+    Return True if the active torch device can run BF16 efficiently. Some
+    consumer Ampere GPUs report BF16 support through PyTorch/Comfy but route
+    model execution through FP32 manual casts, which is much slower. Keep this
+    stricter than Comfy's generic helper for GGUF tensor loading.
+    """
+    try:
+        import comfy.model_management
+        device = torch.device(comfy.model_management.get_torch_device())
+        if device.type != "cuda":
+            return comfy.model_management.should_use_bf16(device)
+
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(index)
+        name = torch.cuda.get_device_name(index).lower()
+
+        # Native fast BF16 is available on GA100/A100-class Ampere, Ada, Hopper,
+        # and newer architectures. GA10x Ampere cards such as RTX 30xx expose
+        # BF16 in some software paths but are slow for this workload.
+        if major >= 9:
+            return True
+        if (major, minor) >= (8, 9):
+            return True
+        if (major, minor) == (8, 0) and ("a100" in name or "a800" in name):
+            return True
+        return False
+    except Exception:
+        return False
 
 def get_orig_shape(reader, tensor_name):
     field_key = f"comfy.gguf.orig_shape.{tensor_name}"
@@ -67,7 +98,7 @@ def get_gguf_metadata(reader):
             continue
     return metadata
 
-def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False):
+def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False, dynamic=False):
     """
     Read state dict as fake tensors
     """
@@ -115,6 +146,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     # main loading loop
     state_dict = {}
     qtype_dict = {}
+    bf16_storage_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
     for sd_key, tensor in tensors:
         tensor_name = tensor.name
         # torch_tensor = torch.from_numpy(tensor.data) # mmap
@@ -134,13 +166,16 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                         shape = shape[:-1]
 
         # add to state dict
-        if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
-            torch_tensor = torch_tensor.view(*shape)
-        state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
-
-        # 1D tensors shouldn't be quantized, this is a fix for BF16
-        if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
-            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
+        if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+            # dtype = torch.float32 if torch_tensor.numel() // 2 <= 10000 else bf16_storage_dtype
+            torch_tensor = torch_tensor.reshape(-1)
+            state_dict[sd_key] = torch_tensor.view(torch.bfloat16).reshape(*shape).to(bf16_storage_dtype)
+        elif tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+            state_dict[sd_key] = torch_tensor.view(*shape)
+        elif dynamic:
+            state_dict[sd_key] = make_quantized(torch_tensor, tensor.tensor_type, shape)
+        else:
+            state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
@@ -219,6 +254,30 @@ CLIP_VISION_SD_MAP = {
     "ln2.": "norm2.",
 }
 
+CLIP_VISION_QWEN3_MAP = {
+    "v.blk": "model.visual.blocks",  
+    "attn_out": "attn.proj",
+    "ln1": "norm1",
+    "ln2": "norm2",
+    "attn_qkv": "attn.qkv",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "mm.0": "model.visual.merger.linear_fc1",
+    "mm.2": "model.visual.merger.linear_fc2",
+    "v.post_ln": "model.visual.merger.norm",
+    "v.patch_embd": "model.visual.patch_embed.proj",
+    "v.position_embd.weight": "visual.pos_embed.weight",
+    "v.deepstack.8.norm": "model.visual.deepstack_merger_list.0.norm",
+    "v.deepstack.8.fc1": "model.visual.deepstack_merger_list.0.linear_fc1",
+    "v.deepstack.8.fc2": "model.visual.deepstack_merger_list.0.linear_fc2",
+    "v.deepstack.16.norm": "model.visual.deepstack_merger_list.1.norm",
+    "v.deepstack.16.fc1": "model.visual.deepstack_merger_list.1.linear_fc1",
+    "v.deepstack.16.fc2": "model.visual.deepstack_merger_list.1.linear_fc2",
+    "v.deepstack.24.norm": "model.visual.deepstack_merger_list.2.norm",
+    "v.deepstack.24.fc1": "model.visual.deepstack_merger_list.2.linear_fc1",
+    "v.deepstack.24.fc2": "model.visual.deepstack_merger_list.2.linear_fc2",
+}
+
 def sd_map_replace(raw_sd, key_map):
     sd = {}
     for k,v in raw_sd.items():
@@ -290,7 +349,7 @@ def gguf_mmproj_loader(path):
             target.append(fname)
 
     if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
+        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')!")
         return {}
     if len(target) > 1:
         logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
@@ -305,7 +364,15 @@ def gguf_mmproj_loader(path):
         w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
 
-    # run main replacement
+
+    # qwen3vl
+    if "v.deepstack.8.norm.weight" in vsd:
+        for k in list(vsd.keys()):
+            vsd[k] = dequantize_tensor(vsd[k], dtype=torch.float32)         
+        return sd_map_replace(vsd, CLIP_VISION_QWEN3_MAP)
+
+
+    # qwen2vl
     vsd = sd_map_replace(vsd, CLIP_VISION_SD_MAP)
 
     # handle split Q/K/V
@@ -347,7 +414,7 @@ def gguf_tokenizer_loader(path, temb_shape):
 
     if get_field(reader, "tokenizer.ggml.model", str) == "t5":
         if temb_shape == (256384, 4096): # probably UMT5
-            spm.trainer_spec.model_type == 1 # Unigram (do we have a T5 w/ BPE?)
+            spm.trainer_spec.model_type = 1 # Unigram (do we have a T5 w/ BPE?)
         else:
             raise NotImplementedError("Unknown model, can't set tokenizer!")
     else:
@@ -467,8 +534,8 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
-def gguf_clip_loader(path):
-    sd, extra = gguf_sd_loader(path, is_text_model=True)
+def gguf_clip_loader(path, dynamic=False):
+    sd, extra = gguf_sd_loader(path, is_text_model=True, dynamic=dynamic)
     arch = extra.get("arch_str", None)
     if arch in {"t5", "t5encoder"}:
         temb_key = "token_embd.weight"
@@ -498,9 +565,13 @@ def gguf_clip_loader(path):
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch == "qwen2vl":
+        if arch == "qwen2vl" or arch == "qwen3vl":
             vsd = gguf_mmproj_loader(path)
-            sd.update(vsd)
+            if not vsd and arch == "qwen3vl":
+                sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(4608)
+                sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(4096)
+            else:
+                sd.update(vsd)
     else:
         pass
     return sd
